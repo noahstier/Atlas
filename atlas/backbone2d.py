@@ -14,7 +14,7 @@ import fvcore.nn.weight_init as weight_init
 def build_backbone2d(cfg):
     """ Builds 2D feature extractor backbone network from Detectron2."""
 
-    output_dim = cfg.MODEL.BACKBONE3D.CHANNELS[0]
+    output_dim = cfg.MODEL.BACKBONE3D.CHANNELS[0] // 2
     norm = cfg.MODEL.FPN.NORM
     output_stride = 4  # TODO: make configurable
 

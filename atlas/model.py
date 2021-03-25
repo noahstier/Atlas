@@ -135,6 +135,7 @@ class VoxelNet(pl.LightningModule):
         """
 
         self.volume = 0
+        self.volume_sq = 0
         self.valid = 0
 
     def normalizer(self, x):
@@ -185,6 +186,8 @@ class VoxelNet(pl.LightningModule):
         self.volume = self.volume + volume
         self.valid = self.valid + valid
 
+        self.volume_sq = self.volume_sq + volume ** 2
+
     def inference2(self, targets=None):
         """ Refines accumulated features and regresses output TSDF.
 
@@ -201,11 +204,20 @@ class VoxelNet(pl.LightningModule):
         """
 
         volume = self.volume/self.valid
-
         # remove nans (where self.valid==0)
         volume = volume.transpose(0,1)
         volume[:,self.valid.squeeze(1)==0]=0
         volume = volume.transpose(0,1)
+
+        volume_sq = self.volume_sq/self.valid
+
+        volume_sq = volume_sq.transpose(0,1)
+        volume_sq[:,self.valid.squeeze(1)==0]=0
+        volume_sq = volume_sq.transpose(0,1)
+
+        self.var_vol = volume_sq - volume ** 2
+
+        volume = torch.cat((volume, self.var_vol), dim=1)
 
         x = self.backbone3d(volume)
         return self.heads3d(x, targets)
