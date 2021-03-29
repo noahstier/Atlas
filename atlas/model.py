@@ -389,7 +389,8 @@ class VoxelNet(pl.LightningModule):
             #     self.logger.experiment.add_image('semseg2d', viz)
             
         loss = sum(losses.values())
-        return {'loss': loss, 'log': losses}
+        self.logger.experiment.log({'train/loss': loss.item(), **{'train/' + k: v.item() for k, v in losses.items()}})
+        return loss
 
     def validation_step(self, batch, batch_idx):
         outputs, losses = self.forward(batch)

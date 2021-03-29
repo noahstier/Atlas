@@ -37,6 +37,9 @@ class CudaClearCacheCallback(pl.Callback):
 
 if __name__ == "__main__":
 
+    import wandb
+    wandb.init(project='atlas')
+
     args = get_parser().parse_args()
 
     cfg = get_cfg(args)

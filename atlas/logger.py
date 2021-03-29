@@ -17,6 +17,7 @@
 import os
 
 from pytorch_lightning.loggers import TensorBoardLogger
+from pytorch_lightning.loggers import WandbLogger
 import torch
 
 
@@ -37,14 +38,14 @@ class MeshWriter:
         mesh.export(os.path.join(self._save_path, name))
 
 
-class AtlasLogger(TensorBoardLogger):
+class AtlasLogger(WandbLogger):
     """ Does tensorboard logging + has a MeshWriter for saving example
     meshes throughout training"""
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-        self._experiment1 = MeshWriter(self.log_dir)
+        self._experiment1 = MeshWriter(self.save_dir)
 
     @property
     def experiment1(self) -> MeshWriter:
