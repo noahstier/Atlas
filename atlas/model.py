@@ -54,7 +54,7 @@ class VoxelNet(pl.LightningModule):
         self.heads3d = VoxelHeads(cfg)
 
         self.view_mlp = torch.nn.Sequential(
-            torch.nn.Linear(5, 16),
+            torch.nn.Linear(3, 16),
             torch.nn.ReLU(),
             torch.nn.Linear(16, 16),
             torch.nn.ReLU(),
@@ -145,9 +145,7 @@ class VoxelNet(pl.LightningModule):
         view_vecs = (pose[:, :3, 3, None] - world[:, :3]).type_as(features)
         ranges = torch.norm(view_vecs, dim=1, keepdim=True).type_as(features)
         view_vecs /= ranges
-        depths = pz[:, None].type_as(features)
-        view_feats = torch.cat((view_vecs, ranges, depths), dim=1).transpose(1, 2)
-        view_feats = self.view_mlp(view_feats).transpose(1, 2)
+        view_feats = self.view_mlp(view_vecs.transpose(1, 2)).transpose(1, 2)
 
         view_volume = torch.zeros(
             batch, view_feats.shape[1], nx*ny*nz, dtype=view_feats.dtype, device=device
