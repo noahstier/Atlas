@@ -17,6 +17,7 @@
 import os
 import json
 
+import cv2
 import numpy as np
 from PIL import Image
 import torch
@@ -57,6 +58,94 @@ def map_frame(frame, frame_types=[]):
     data['image'] = Image.open(frame['file_name_image'])
     data['intrinsics'] = np.array(frame['intrinsics'], dtype=np.float32)
     data['pose'] = np.array(frame['pose'], dtype=np.float32)
+
+    depth_imgfile = os.path.join(
+        os.path.dirname(os.path.dirname(frame['file_name_image'])),
+        'depth',
+        os.path.basename(frame['file_name_image']).replace('.jpg', '.png')
+    )
+    depth = np.asarray(Image.open(depth_imgfile)).astype(np.float32) / 1000
+    depth[depth == 0] = np.nan
+    _depth = cv2.GaussianBlur(depth, (5, 5), 2)
+
+    pose = data['pose']
+
+    dy, dx = np.gradient(_depth, 5)
+    normal = np.stack((-dx,  -dy, .001 * np.ones_like(dx)), axis=-1)
+    normal /= np.linalg.norm(normal, axis=-1, keepdims=True)
+    normal = -normal
+    world_normal = (normal @ pose[:3, :3].T)
+    world_normal[np.isnan(world_normal)] = 0
+
+    data['normal'] = torch.from_numpy(world_normal)
+
+    # data['depth_intrinsic'] = torch.Tensor([
+    #     [577.590698,   0.      , 318.905426],
+    #     [  0.      , 578.729797, 242.683609],
+    #     [  0.      ,   0.      ,   1.      ],
+    # ])
+
+    '''
+    imheight, imwidth = depth.shape
+    u = np.arange(imwidth)
+    v = np.arange(imheight)
+    uu, vv = np.meshgrid(u, v)
+    uv = np.c_[uu.flatten(), vv.flatten()]
+
+
+    k = np.array([
+        [577.590698,   0.      , 318.905426,   0.      ],
+        [  0.      , 578.729797, 242.683609,   0.      ],
+        [  0.      ,   0.      ,   1.      ,   0.      ],
+        [  0.      ,   0.      ,   0.      ,   1.      ]
+    ])
+
+    pix_vecs = (np.linalg.inv(k[:3, :3]) @ np.c_[uv, np.ones(len(uv))].T).T
+
+    ranges = depth.flatten()
+    inds = ~np.isnan(ranges)
+    xyz_cam = pix_vecs * ranges[:, None]
+    xyz_world = (pose @ np.c_[xyz_cam, np.ones(len(xyz_cam))].T).T[:, :3]
+    xyz_world = xyz_world[inds]
+    rgb_img = cv2.resize(np.asarray(data['image']), (imwidth, imheight), None, 0, 0, cv2.INTER_LINEAR)
+    rgb = np.asarray(rgb_img).reshape(-1, 3)[inds] / 255
+
+    _world_normal = world_normal.reshape(-1, 3)[inds]
+
+    inds = np.arange(len(xyz_world))
+    inds = np.random.choice(inds, size=len(inds) // 10, replace=False)
+    
+    xyz_world = xyz_world[inds]
+    _world_normal = _world_normal[inds]
+    rgb = rgb[inds]
+
+    import open3d as o3d
+    pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(xyz_world))
+    pcd.colors = o3d.utility.Vector3dVector(rgb)
+    axes = o3d.geometry.TriangleMesh.create_coordinate_frame()
+    lines = o3d.geometry.LineSet(
+        o3d.utility.Vector3dVector(
+            np.concatenate((xyz_world, xyz_world + _world_normal * .1), axis=0)
+        ),
+        o3d.utility.Vector2iVector(
+            np.stack((np.arange(len(xyz_world)), len(xyz_world) + np.arange(len(xyz_world))), axis=-1)
+        )
+    )
+    # import matplotlib.pyplot as plt
+    # plt.subplot(121)
+    # plt.imshow(depth)
+    # plt.subplot(122)
+    # plt.imshow(world_normal)
+    # plt.show()
+    o3d.visualization.draw_geometries([pcd, axes, lines])
+    # o3d.visualization.draw_geometries([pcd, axes])
+    import ipdb
+    ipdb.set_trace()
+    '''
+
+
+
+
     if 'depth' in frame_types:
         depth = Image.open(frame['file_name_depth'])
         depth = np.array(depth, dtype=np.float32) / DEPTH_SHIFT
