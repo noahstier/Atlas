@@ -32,55 +32,6 @@ import atlas.transforms as transforms
 from atlas.tsdf import coordinates, TSDF
 
 
-def backproject(voxel_dim, voxel_size, origin, projection, features):
-    """ Takes 2d features and fills them along rays in a 3d volume
-
-    This function implements eqs. 1,2 in https://arxiv.org/pdf/2003.10432.pdf
-    Each pixel in a feature image corresponds to a ray in 3d.
-    We fill all the voxels along the ray with that pixel's features.
-
-    Args:
-        voxel_dim: size of voxel volume to construct (nx,ny,nz)
-        voxel_size: metric size of each voxel (ex: .04m)
-        origin: origin of the voxel volume (xyz position of voxel (0,0,0))
-        projection: bx4x3 projection matrices (intrinsics@extrinsics)
-        features: bxcxhxw  2d feature tensor to be backprojected into 3d
-
-    Returns:
-        volume: b x c x nx x ny x nz 3d feature volume
-        valid:  b x 1 x nx x ny x nz volume.
-                Each voxel contains a 1 if it projects to a pixel
-                and 0 otherwise (not in view frustrum of the camera)
-    """
-
-    batch = features.size(0)
-    channels = features.size(1)
-    device = features.device
-    nx, ny, nz = voxel_dim
-
-    coords = coordinates(voxel_dim, device).unsqueeze(0).expand(batch,-1,-1) # bx3xhwd
-    world = coords.type_as(projection) * voxel_size + origin.to(device).unsqueeze(2)
-    world = torch.cat((world, torch.ones_like(world[:,:1]) ), dim=1)
-    
-    camera = torch.bmm(projection, world)
-    px = (camera[:,0,:]/camera[:,2,:]).round().type(torch.long)
-    py = (camera[:,1,:]/camera[:,2,:]).round().type(torch.long)
-    pz = camera[:,2,:]
-
-    # voxels in view frustrum
-    height, width = features.size()[2:]
-    valid = (px >= 0) & (py >= 0) & (px < width) & (py < height) & (pz>0) # bxhwd
-
-    # put features in volume
-    volume = torch.zeros(batch, channels, nx*ny*nz, dtype=features.dtype, 
-                         device=device)
-    for b in range(batch):
-        volume[b,:,valid[b]] = features[b,:,py[b,valid[b]], px[b,valid[b]]]
-
-    volume = volume.view(batch, channels, nx, ny, nz)
-    valid = valid.view(batch, 1, nx, ny, nz)
-
-    return volume, valid
 
 
 class VoxelNet(pl.LightningModule):
@@ -123,7 +74,32 @@ class VoxelNet(pl.LightningModule):
         self.voxel_sizes = [int(cfg.VOXEL_SIZE*100)*2**i for i in 
                             range(len(cfg.MODEL.BACKBONE3D.LAYERS_DOWN)-1)]
 
-        self.initialize_volume()
+        self.initialize_volume() 
+
+        # self.cfg['MODEL']['BACKBONE3D']['CHANNELS'][0]
+        n_depth_planes = 32
+        self.depth_dependent_conv = torch.nn.Sequential(
+            torch.nn.Conv2d(
+                1,
+                n_depth_planes,
+                3,
+                padding=1,
+            ),
+            torch.nn.Conv2d(
+                n_depth_planes,
+                n_depth_planes,
+                3,
+                padding=1,
+                groups=n_depth_planes
+            ),
+            torch.nn.Conv2d(
+                n_depth_planes,
+                n_depth_planes,
+                3,
+                padding=1,
+                groups=n_depth_planes
+            ),
+        )
 
 
     def initialize_volume(self):
@@ -140,6 +116,79 @@ class VoxelNet(pl.LightningModule):
     def normalizer(self, x):
         """ Normalizes the RGB images to the input range"""
         return (x - self.pixel_mean.type_as(x)) / self.pixel_std.type_as(x)
+
+    def backproject(self, voxel_dim, voxel_size, origin, projection, features):
+        """ Takes 2d features and fills them along rays in a 3d volume
+    
+        This function implements eqs. 1,2 in https://arxiv.org/pdf/2003.10432.pdf
+        Each pixel in a feature image corresponds to a ray in 3d.
+        We fill all the voxels along the ray with that pixel's features.
+    
+        Args:
+            voxel_dim: size of voxel volume to construct (nx,ny,nz)
+            voxel_size: metric size of each voxel (ex: .04m)
+            origin: origin of the voxel volume (xyz position of voxel (0,0,0))
+            projection: bx4x3 projection matrices (intrinsics@extrinsics)
+            features: bxcxhxw  2d feature tensor to be backprojected into 3d
+    
+        Returns:
+            volume: b x c x nx x ny x nz 3d feature volume
+            valid:  b x 1 x nx x ny x nz volume.
+                    Each voxel contains a 1 if it projects to a pixel
+                    and 0 otherwise (not in view frustrum of the camera)
+        """
+    
+        batch = features.size(0)
+        channels = features.size(1)
+        device = features.device
+        dtype = features.dtype
+        nx, ny, nz = voxel_dim
+    
+        coords = coordinates(voxel_dim, device).unsqueeze(0).expand(batch,-1,-1) # bx3xhwd
+        world = coords.type_as(projection) * voxel_size + origin.to(device).unsqueeze(2)
+        world = torch.cat((world, torch.ones_like(world[:,:1]) ), dim=1)
+
+        height, width = features.size()[2:]
+        max_depth = 3
+        
+        camera = torch.bmm(projection, world)
+        uu = (camera[:, 0] / camera[:, 2]) / width * 2 - 1
+        vv = (camera[:, 1] / camera[:, 2]) / height * 2 - 1
+        depth = camera[:, 2] / max_depth * 2 - 1
+
+        volume = torch.zeros(batch, channels, nx*ny*nz, dtype=features.dtype, device=device)
+
+        # voxels in view frustum
+        valid = (uu >= -1) & (vv >= -1) & (uu <= 1) & (vv <= 1) & (depth >= -1) & (depth <= max_depth)
+
+        if torch.sum(valid) == 0:
+            volume = volume.view(batch, channels, nx, ny, nz)
+            valid = valid.view(batch, 1, nx, ny, nz)
+            return volume, valid
+
+        frustum_volume = torch.zeros(
+            (*features.shape[:2], self.depth_dependent_conv[0].out_channels, *features.shape[2:]),
+            device=device,
+            dtype=dtype
+        )
+        for i in range(features.shape[1]):
+            frustum_volume[:, i] = self.depth_dependent_conv(features[:, i:i + 1])
+    
+        # put features in volume
+        for b in range(batch):
+            grid = torch.stack((depth[b, valid[b]], vv[b, valid[b]], uu[b, valid[b]]), dim=-1)
+            _features = torch.nn.functional.grid_sample(
+                frustum_volume,
+                grid[None, :, None, None],
+                align_corners=False
+            )
+
+            volume[b,:,valid[b]] = _features[0, :, :, 0, 0]
+    
+        volume = volume.view(batch, channels, nx, ny, nz)
+        valid = valid.view(batch, 1, nx, ny, nz)
+    
+        return volume, valid
 
     def inference1(self, projection, image=None, feature=None):
         """ Backprojects image features into 3D and accumulates them.
@@ -175,7 +224,7 @@ class VoxelNet(pl.LightningModule):
             voxel_dim = self.voxel_dim_train
         else:
             voxel_dim = self.voxel_dim_val
-        volume, valid = backproject(voxel_dim, self.voxel_size, self.origin,
+        volume, valid = self.backproject(voxel_dim, self.voxel_size, self.origin,
                                     projection, feature)
 
         if self.finetune3d:
