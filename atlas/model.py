@@ -64,9 +64,9 @@ class VoxelNet(pl.LightningModule):
         self.origin = torch.tensor([0,0,0]).view(1,3)
 
         self.mlp = torch.nn.Sequential(
-            torch.nn.Linear(3, 16),
+            torch.nn.Linear(3, 8),
             torch.nn.ReLU(),
-            torch.nn.Linear(16, 32),
+            torch.nn.Linear(8, 8),
             torch.nn.ReLU(),
         )
 
@@ -121,7 +121,7 @@ class VoxelNet(pl.LightningModule):
         """
     
         batch = features.size(0)
-        channels = features.size(1)
+        channels = features.size(1) + 8
         device = features.device
         nx, ny, nz = voxel_dim
     
@@ -151,7 +151,7 @@ class VoxelNet(pl.LightningModule):
             normal_embedding = self.mlp(_normal).transpose(0, 1)
             _features = features[b,:,py[b,valid[b]], px[b,valid[b]]]
 
-            volume[b,:,valid[b]] = _features + normal_embedding
+            volume[b,:,valid[b]] = torch.cat((_features, normal_embedding), dim=0)
     
         volume = volume.view(batch, channels, nx, ny, nz)
         valid = valid.view(batch, 1, nx, ny, nz)
