@@ -71,7 +71,8 @@ def map_frame(frame, frame_types=[]):
     pose = data['pose']
 
     dy, dx = np.gradient(_depth, 5)
-    normal = np.stack((-dx,  -dy, .001 * np.ones_like(dx)), axis=-1)
+    pixel_length = .0003
+    normal = np.stack((-dx,  -dy, pixel_length * np.ones_like(dx)), axis=-1)
     normal /= np.linalg.norm(normal, axis=-1, keepdims=True)
     normal = -normal
     world_normal = (normal @ pose[:3, :3].T)
