@@ -48,6 +48,10 @@ if __name__ == "__main__":
     model.backbone3d.requires_grad_(False)
     model.heads2d.requires_grad_(False)
     model.heads3d.requires_grad_(False)
+    model.backbone2d.eval()
+    model.backbone3d.eval()
+    model.heads2d.eval()
+    model.heads3d.eval()
 
     save_path = os.path.join(cfg.LOG_DIR, cfg.TRAINER.NAME, cfg.TRAINER.VERSION)
     logger = AtlasLogger(save_dir=save_path, project='atlas')
