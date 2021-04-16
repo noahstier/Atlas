@@ -37,20 +37,22 @@ class CudaClearCacheCallback(pl.Callback):
 
 if __name__ == "__main__":
 
-    import wandb
-    wandb.init(project='atlas')
-
     args = get_parser().parse_args()
 
     cfg = get_cfg(args)
     model = VoxelNet(cfg.convert_to_dict())
 
     save_path = os.path.join(cfg.LOG_DIR, cfg.TRAINER.NAME, cfg.TRAINER.VERSION)
-    logger = AtlasLogger(cfg.LOG_DIR, cfg.TRAINER.NAME, cfg.TRAINER.VERSION)
+    logger = AtlasLogger(save_dir=save_path, project='atlas')
+    logger.experiment
+
     checkpoint_callback = pl.callbacks.ModelCheckpoint(
-        filepath=os.path.join(save_path, '{epoch:03d}'),
-        save_top_k=-1,
-        period=cfg.TRAINER.CHECKPOINT_PERIOD)
+        dirpath=os.path.join('checkpoints/', logger.experiment.name),
+        # save_top_k=10,
+        # monitor='val_loss',
+        save_last=True,
+        verbose=True
+    )
 
     trainer = pl.Trainer(
         logger=logger,
