@@ -45,6 +45,13 @@ if __name__ == "__main__":
     cfg = get_cfg(args)
     model = VoxelNet(cfg.convert_to_dict())
 
+    model = model.load_from_checkpoint('confused-snow.ckpt', strict=False)
+
+    model.backbone2d.requires_grad_(False)
+    model.backbone3d.requires_grad_(False)
+    model.heads2d.requires_grad_(False)
+    model.heads3d.requires_grad_(False)
+
     save_path = os.path.join(cfg.LOG_DIR, cfg.TRAINER.NAME, cfg.TRAINER.VERSION)
     logger = AtlasLogger(cfg.LOG_DIR, cfg.TRAINER.NAME, cfg.TRAINER.VERSION)
     checkpoint_callback = pl.callbacks.ModelCheckpoint(
