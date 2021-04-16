@@ -88,6 +88,29 @@ def process(info_file, model, num_frames, save_path, total_scenes_index, total_s
                          image=d['image'].unsqueeze(0).cuda())
     outputs, losses = model.inference2()
 
+
+    tsdf_estimate = outputs['vol_04_tsdf'][:, 0]
+    density_estimate = 1 / (1 + torch.exp(-4 * tsdf_estimate))
+    density_estimate = density_estimate.to(tsdf_estimate.dtype)
+    model.initialize_volume()
+    for j, d in enumerate(dataloader):
+
+        # logging progress
+        if j%25==0:
+            print(total_scenes_index,
+                  total_scenes_count,
+                  dataset.info['dataset'],
+                  scene,
+                  j,
+                  len(dataloader)
+            )
+
+        model.inference1(d['projection'].unsqueeze(0).cuda(), image=d['image'].unsqueeze(0).cuda(), density=density_estimate, pose=d['pose'].unsqueeze(0).cuda())
+
+    volume = model.volume / torch.exp(model.valid[:, None]).type_as(model.volume)
+    x = model.backbone3d_2(volume)
+    outputs, losses = model.heads3d_2(x)
+
     tsdf_pred = model.postprocess(outputs)[0]
 
     # TODO: set origin in model... make consistent with offset above?
