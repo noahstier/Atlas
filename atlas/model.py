@@ -554,13 +554,14 @@ class VoxelNet(pl.LightningModule):
         self.logger.experiment1.save_mesh(trgt_tsdfs[0], 
                                           batch['scene'][0]+'_trgt.ply')
 
-        return losses
+        loss = sum(losses.values())
+        self.logger.experiment.log({'val/loss': loss.item(), **{'val/' + k: v.item() for k, v in losses.items()}})
 
-    def validation_epoch_end(self, outputs):
-        avg_losses = {'val_'+key:torch.stack([x[key] for x in outputs]).mean() 
-                      for key in outputs[0].keys()}
-        avg_loss = sum(avg_losses.values())
-        return {'val_loss': avg_loss, 'log': avg_losses}
+    # def validation_epoch_end(self, outputs):
+    #     avg_losses = {'val_'+key:torch.stack([x[key] for x in outputs]).mean() 
+    #                   for key in outputs[0].keys()}
+    #     avg_loss = sum(avg_losses.values())
+    #     return {'val_loss': avg_loss, 'log': avg_losses}
 
 
     def configure_optimizers(self):
