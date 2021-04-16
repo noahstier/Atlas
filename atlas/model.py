@@ -175,19 +175,26 @@ class VoxelNet(pl.LightningModule):
         # voxels in view frustrum
         valid = (px >= 0) & (py >= 0) & (px < width) & (py < height) & (pz>0) # bxhwd
 
+        if density is not None:
+            absorption = torch.zeros((batch, nx, ny, nz), device=features.device, dtype=features.dtype)
+
         # put features in volume
         volume = torch.zeros(batch, channels, nx*ny*nz, dtype=features.dtype, device=device)
         for b in range(batch):
             if density is None:
                 volume[b,:,valid[b]] = features[b,:,py[b,valid[b]], px[b,valid[b]]]
             else:
-                absorption = self.get_absorption(pose[b], world_voxels[b, :, in_frustum[b]], density_estimate[b])
-                volume[b,:,valid[b]] = absorption * features[b,:,py[b,valid[b]], px[b,valid[b]]]
+                _absorption = self.get_absorption(pose[b], world[b, :3, valid[b]], density[b])
+                volume[b,:,valid[b]] = _absorption * features[b,:,py[b,valid[b]], px[b,valid[b]]]
+                absorption[b, valid[b].reshape(nx, ny, nz)] += _absorption
 
         volume = volume.view(batch, channels, nx, ny, nz)
-        valid = valid.view(batch, 1, nx, ny, nz)
+        if density is None:
+            weights = valid.view(batch, 1, nx, ny, nz)
+        else:
+            weights = absorption
 
-        return volume, valid
+        return volume, weights
 
     def inference1(self, projection, image=None, feature=None, density=None, pose=None):
         """ Backprojects image features into 3D and accumulates them.
@@ -327,19 +334,22 @@ class VoxelNet(pl.LightningModule):
                 self.inference1(projection, feature=feature)
 
         # run 3d cnn
-        outputs3d, losses3d = self.inference2(targets3d)
+        outputs3d_iter1, losses3d_iter1 = self.inference2(targets3d)
+        losses3d_iter1 = {k + '_iter1': v for k, v in losses3d_iter1.items()} 
 
-        tsdf_estimate = outputs3d['vol_04_tsdf'][:, 0]
+
+
+        tsdf_estimate = outputs3d_iter1['vol_04_tsdf'][:, 0]
 
         density_estimate = 1 / (1 + torch.exp(-4 * tsdf_estimate))
         density_estimate = density_estimate.to(tsdf_estimate.dtype)
 
-        pose = batch['pose']
+        poses = batch['pose'].transpose(0, 1)
         self.initialize_volume()
 
         if (not self.batch_backbone2d_time) or (not self.training) or self.finetune3d:
             # run images through 2d cnn sequentially and backproject and accumulate
-            for image, projection in zip(images, projections):
+            for image, projection, pose in zip(images, projections, poses):
                 self.inference1(projection, image=image, density=density_estimate, pose=pose)
 
         else:
@@ -365,15 +375,16 @@ class VoxelNet(pl.LightningModule):
                     images.shape[0], images.shape[1], *value.shape[1:]) 
                 for key, value in outputs2d.items()}
 
-            for projection, feature in zip(projections, features):
+            for projection, feature, pose in zip(projections, features, poses):
                 self.inference1(projection, feature=feature, density=density_estimate, pose=pose)
 
-        volume = self.volume / torch.exp(self.valid)
+        volume = self.volume / (1 + self.valid[:, None]).type_as(self.volume)
+        # volume = self.volume
 
         x = self.backbone3d_2(volume)
-        outputs3d, losses3d = self.heads3d_2(x, targets)
+        outputs3d, losses3d = self.heads3d_2(x, targets3d)
 
-        return {**outputs2d, **outputs3d}, {**losses2d, **losses3d}
+        return {**outputs2d, **outputs3d}, {**losses2d, **losses3d}, {**losses3d_iter1}
 
     def get_absorption(self, pose, voxel_centers, density):
 
@@ -519,7 +530,7 @@ class VoxelNet(pl.LightningModule):
 
 
     def training_step(self, batch, batch_idx):
-        outputs, losses = self.forward(batch)
+        outputs, losses, extra_logs = self.forward(batch)
         
         # visualize training outputs at the begining of each epoch
         if batch_idx==0:
@@ -540,11 +551,15 @@ class VoxelNet(pl.LightningModule):
             #     self.logger.experiment.add_image('semseg2d', viz)
             
         loss = sum(losses.values())
-        self.logger.experiment.log({'train/loss': loss.item(), **{'train/' + k: v.item() for k, v in losses.items()}})
+        self.logger.experiment.log({
+            'train/loss': loss.item(),
+            **{'train/' + k: v.item() for k, v in extra_logs.items()},
+            **{'train/' + k: v.item() for k, v in losses.items()}
+        })
         return loss
 
     def validation_step(self, batch, batch_idx):
-        outputs, losses = self.forward(batch)
+        outputs, losses, extra_logs = self.forward(batch)
 
         # save validation meshes
         pred_tsdfs = self.postprocess(outputs)
@@ -555,8 +570,7 @@ class VoxelNet(pl.LightningModule):
                                           batch['scene'][0]+'_trgt.ply')
 
         loss = sum(losses.values())
-        self.logger.experiment.log({'val/loss': loss.item(), **{'val/' + k: v.item() for k, v in losses.items()}})
-
+        self.logger.experiment.log({'val/loss': loss.item(), **{'val/' + k: v.item() for k, v in losses.items()}, **{'val/' + k: v.item() for k, v in extra_logs.items()}})
     # def validation_epoch_end(self, outputs):
     #     avg_losses = {'val_'+key:torch.stack([x[key] for x in outputs]).mean() 
     #                   for key in outputs[0].keys()}
@@ -575,6 +589,10 @@ class VoxelNet(pl.LightningModule):
                         self.heads2d, self.heads3d]
         params_rest = itertools.chain(*(params.parameters() 
                                         for params in modules_rest))
+
+        modules_iter2 = [self.backbone3d_2, self.heads3d_2]
+        params_iter2 = itertools.chain(*(params.parameters() for params in modules_iter2))
+        return torch.optim.Adam(params_iter2, lr=.001)
         
         # optimzer
         if self.cfg.OPTIMIZER.TYPE == 'Adam':
@@ -584,6 +602,7 @@ class VoxelNet(pl.LightningModule):
                 {'params': params_backbone2d, 'lr': lr_backbone2d},
                 {'params': params_rest, 'lr': lr}])
             optimizers.append(optimizer)
+
 
         else:
             raise NotImplementedError(
