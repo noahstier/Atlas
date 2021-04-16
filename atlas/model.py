@@ -138,7 +138,7 @@ class VoxelNet(pl.LightningModule):
         """ Normalizes the RGB images to the input range"""
         return (x - self.pixel_mean.type_as(x)) / self.pixel_std.type_as(x)
 
-    def backproject(self, voxel_dim, voxel_size, origin, projection, features):
+    def backproject(self, voxel_dim, voxel_size, origin, projection, features, density=None, pose=None):
         """ Takes 2d features and fills them along rays in a 3d volume
     
         This function implements eqs. 1,2 in https://arxiv.org/pdf/2003.10432.pdf
@@ -172,27 +172,24 @@ class VoxelNet(pl.LightningModule):
         py = (camera[:,1,:]/camera[:,2,:]).round().type(torch.long)
         pz = camera[:,2,:]
 
-        z_ind = torch.round((pz - self.near_plane) / (self.far_plane - self.near_plane) * self.n_depth_bins).long()
-        z_ind = torch.clamp(z_ind, 0, self.n_depth_bins - 1)
-
-        # filtered_features = self.depth_dependent_conv(features)
-
         # voxels in view frustrum
         valid = (px >= 0) & (py >= 0) & (px < width) & (py < height) & (pz>0) # bxhwd
 
         # put features in volume
-        volume = torch.zeros(batch, channels, nx*ny*nz, dtype=features.dtype,
-                             device=device)
+        volume = torch.zeros(batch, channels, nx*ny*nz, dtype=features.dtype, device=device)
         for b in range(batch):
-            volume[b,:,valid[b]] = features[b,:,py[b,valid[b]], px[b,valid[b]]]
-            # volume[b,:,valid[b]] = filtered_features[b, :, z_ind[b, valid[b]], py[b, valid[b]], px[b, valid[b]]]
+            if density is None:
+                volume[b,:,valid[b]] = features[b,:,py[b,valid[b]], px[b,valid[b]]]
+            else:
+                absorption = self.get_absorption(pose[b], world_voxels[b, :, in_frustum[b]], density_estimate[b])
+                volume[b,:,valid[b]] = absorption * features[b,:,py[b,valid[b]], px[b,valid[b]]]
 
         volume = volume.view(batch, channels, nx, ny, nz)
         valid = valid.view(batch, 1, nx, ny, nz)
 
         return volume, valid
 
-    def inference1(self, projection, image=None, feature=None):
+    def inference1(self, projection, image=None, feature=None, density=None, pose=None):
         """ Backprojects image features into 3D and accumulates them.
 
         This is the first half of the network which is run on every frame.
@@ -226,8 +223,16 @@ class VoxelNet(pl.LightningModule):
             voxel_dim = self.voxel_dim_train
         else:
             voxel_dim = self.voxel_dim_val
-        volume, valid = self.backproject(voxel_dim, self.voxel_size, self.origin,
-                                    projection, feature)
+
+        if density is None:
+            volume, valid = self.backproject(
+                voxel_dim, self.voxel_size, self.origin, projection, feature,
+            )
+        else:
+            volume, valid = self.backproject(
+                voxel_dim, self.voxel_size, self.origin, projection, feature, density=density, pose=pose
+            )
+
 
         if self.finetune3d:
             volume.detach_()
@@ -290,110 +295,83 @@ class VoxelNet(pl.LightningModule):
         images = image.transpose(0,1)
         projections = projection.transpose(0,1)
 
-        image = images.reshape(images.shape[0]*images.shape[1], *images.shape[2:])
-        image = self.normalizer(image)
-        features = self.backbone2d(image)
+        if (not self.batch_backbone2d_time) or (not self.training) or self.finetune3d:
+            # run images through 2d cnn sequentially and backproject and accumulate
+            for image, projection in zip(images, projections):
+                self.inference1(projection, image=image)
 
-        # run 2d heads
-        if targets2d is not None:
-            targets2d = {
-                key: value.transpose(0,1).view(
-                    images.shape[0]*images.shape[1], *value.shape[2:])
-                for key, value in targets2d.items()}
-        outputs2d, losses2d = self.heads2d(features, targets2d)
-
-        # reshape back
-        features = features.view(images.shape[0],
-                                 images.shape[1],
-                                 *features.shape[1:])
-        outputs2d = {
-            key:value.transpose(0,1).reshape(
-                images.shape[0], images.shape[1], *value.shape[1:]) 
-            for key, value in outputs2d.items()}
-
-
-        # for projection, feature in zip(projections, features):
-        #     self.inference1(projection, feature=feature)
-
-        # # run 3d cnn
-        # outputs3d, losses3d = self.inference2(targets3d)
-
-        if self.training:
-            voxel_dim = self.voxel_dim_train
         else:
-            voxel_dim = self.voxel_dim_val
+            # run all images through 2d cnn together to share batchnorm stats
+            image = images.reshape(images.shape[0]*images.shape[1], *images.shape[2:])
+            image = self.normalizer(image)
+            features = self.backbone2d(image)
 
-        _, batch_size, _, featheight, featwidth = features.shape
+            # run 2d heads
+            if targets2d is not None:
+                targets2d = {
+                    key: value.transpose(0,1).view(
+                        images.shape[0]*images.shape[1], *value.shape[2:])
+                    for key, value in targets2d.items()}
+            outputs2d, losses2d = self.heads2d(features, targets2d)
 
-        tsdf_estimate = torch.zeros((batch_size, *voxel_dim), device=features.device, dtype=features.dtype)
+            # reshape back
+            features = features.view(images.shape[0],
+                                     images.shape[1],
+                                     *features.shape[1:])
+            outputs2d = {
+                key:value.transpose(0,1).reshape(
+                    images.shape[0], images.shape[1], *value.shape[1:]) 
+                for key, value in outputs2d.items()}
 
+            for projection, feature in zip(projections, features):
+                self.inference1(projection, feature=feature)
 
-        for it in range(2):
-            density_estimate = 1 / (1 + torch.exp(-4 * tsdf_estimate))
-            density_estimate = density_estimate.to(tsdf_estimate.dtype)
+        # run 3d cnn
+        outputs3d, losses3d = self.inference2(targets3d)
 
+        tsdf_estimate = outputs3d['vol_04_tsdf'][:, 0]
 
-            coords = coordinates(voxel_dim, features.device).unsqueeze(0).expand(batch_size,-1,-1)
-            world_voxels = coords.type_as(features) * self.voxel_size + self.origin.to(features.device).unsqueeze(2)
-            world_voxels_h = torch.cat((world_voxels, torch.ones_like(world_voxels[:,:1]) ), dim=1)
+        density_estimate = 1 / (1 + torch.exp(-4 * tsdf_estimate))
+        density_estimate = density_estimate.to(tsdf_estimate.dtype)
 
-            volume = torch.zeros((batch_size, features.shape[2], *voxel_dim), device=tsdf_estimate.device, dtype=tsdf_estimate.dtype)
-            weights = torch.zeros((batch_size, *voxel_dim), device=tsdf_estimate.device, dtype=tsdf_estimate.dtype)
+        pose = batch['pose']
+        self.initialize_volume()
 
-            for img_ind in range(features.shape[0]):
-                projection = projections[img_ind].clone().to(world_voxels_h.dtype)
-                projection[:,:2,:] = projection[:,:2,:] / self.backbone2d_stride
+        if (not self.batch_backbone2d_time) or (not self.training) or self.finetune3d:
+            # run images through 2d cnn sequentially and backproject and accumulate
+            for image, projection in zip(images, projections):
+                self.inference1(projection, image=image, density=density_estimate, pose=pose)
 
-                camera = torch.bmm(projection, world_voxels_h)
-                px = torch.round(camera[:, 0, :] / camera[:, 2, :]).long()
-                py = torch.round(camera[:, 1, :] / camera[:, 2, :]).long()
-                pz = camera[:,2,:]
-                in_frustum = (pz > 0) & (px >= 0) & (py >= 0) & (px < featwidth - 1) & (py < featheight - 1)
+        else:
+            # run all images through 2d cnn together to share batchnorm stats
+            image = images.reshape(images.shape[0]*images.shape[1], *images.shape[2:])
+            image = self.normalizer(image)
+            features = self.backbone2d(image)
 
-                pose = batch['pose'][:, img_ind]
+            # run 2d heads
+            if targets2d is not None:
+                targets2d = {
+                    key: value.transpose(0,1).view(
+                        images.shape[0]*images.shape[1], *value.shape[2:])
+                    for key, value in targets2d.items()}
+            outputs2d, losses2d = self.heads2d(features, targets2d)
 
-                for b in range(batch_size):
-                    if not torch.any(in_frustum[b]):
-                        continue
+            # reshape back
+            features = features.view(images.shape[0],
+                                     images.shape[1],
+                                     *features.shape[1:])
+            outputs2d = {
+                key:value.transpose(0,1).reshape(
+                    images.shape[0], images.shape[1], *value.shape[1:]) 
+                for key, value in outputs2d.items()}
 
-                    absorption = self.get_absorption(pose[b], world_voxels[b, :, in_frustum[b]], density_estimate[b])
+            for projection, feature in zip(projections, features):
+                self.inference1(projection, feature=feature, density=density_estimate, pose=pose)
 
-                    '''
-                    import ipdb
-                    ipdb.set_trace()
+        volume = self.volume / torch.exp(self.valid)
 
-                    import open3d as o3d
-                    import matplotlib.pyplot as plt
-                    import numpy as np
-                    cam_pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(batch['pose'][b, :, :3, 3].cpu()))
-                    # in_vox = world_voxels[b].transpose(0, 1)[in_frustum[b]].cpu().float().numpy()
-                    # out_vox = world_voxels[b].transpose(0, 1)[~in_frustum[b]].cpu().float().numpy()
-                    # out_vox = world_voxels[b].transpose(0, 1)[~in_frustum[b]].cpu().float().numpy()
-                    vox_pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(world_voxels[b].transpose(0, 1).cpu().float().numpy()))
-                    # in_vox_pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(in_vox))
-                    # out_vox_pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(out_vox))
-                    # in_vox_pcd.paint_uniform_color(np.array([1, 0, 0], dtype=float))
-                    # out_vox_pcd.paint_uniform_color(np.array([0, 0, 1], dtype=float))
-                    colors = plt.cm.jet(in_frustum[b].cpu().float().numpy())[:, :3]
-                    vox_pcd.colors = o3d.utility.Vector3dVector(colors)
-                    o3d.visualization.draw_geometries([cam_pcd, vox_pcd])
-                    '''
-
-                    f = features[img_ind, b, :, py[b, in_frustum[b]], px[b, in_frustum[b]]]
-
-                    volume[b, :, in_frustum[b].reshape(voxel_dim)] += f * absorption[None]
-                    weights[b, in_frustum[b].reshape(voxel_dim)] += absorption
-
-            if it == 0:
-                x = self.backbone3d(volume)
-                outputs3d, losses3d = self.heads3d(x, targets3d)
-                tsdf_estimate = outputs3d['vol_04_tsdf'][:, 0]
-                losses3d = {k + '_1': v for k, v in losses3d.items()}
-            elif it == 1:
-                x = self.backbone3d_2(volume)
-                _outputs3d, _losses3d = self.heads3d_2(x, targets3d)
-                for k, v in _losses3d.items():
-                    losses3d[k] = v
+        x = self.backbone3d_2(volume)
+        outputs3d, losses3d = self.heads3d_2(x, targets)
 
         return {**outputs2d, **outputs3d}, {**losses2d, **losses3d}
 
@@ -523,7 +501,7 @@ class VoxelNet(pl.LightningModule):
             self.frame_types, self.frame_selection, self.voxel_types,
             self.voxel_sizes)
         dataloader = torch.utils.data.DataLoader(
-            dataset, batch_size=self.batch_size_train, num_workers=2,
+            dataset, batch_size=self.batch_size_train, num_workers=4,
             collate_fn=collate_fn, shuffle=True, drop_last=True)
         return dataloader
 
