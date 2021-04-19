@@ -45,10 +45,18 @@ if __name__ == "__main__":
     cfg = get_cfg(args)
     model = VoxelNet(cfg.convert_to_dict())
 
+    model = model.load_from_checkpoint('results/release/semseg/final.ckpt', strict=False)
+    model.batch_size_train = 2
+
+    model.backbone2d.requires_grad_(False)
+    model.heads2d.requires_grad_(False)
+    model.backbone2d.eval()
+    model.heads2d.eval()
+
     save_path = os.path.join(cfg.LOG_DIR, cfg.TRAINER.NAME, cfg.TRAINER.VERSION)
     logger = AtlasLogger(cfg.LOG_DIR, cfg.TRAINER.NAME, cfg.TRAINER.VERSION)
     checkpoint_callback = pl.callbacks.ModelCheckpoint(
-        filepath=os.path.join(save_path, '{epoch:03d}'),
+        dirpath=os.path.join('checkpoints', logger.experiment.name),
         save_top_k=-1,
         period=cfg.TRAINER.CHECKPOINT_PERIOD)
 

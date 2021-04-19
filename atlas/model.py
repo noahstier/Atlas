@@ -37,15 +37,23 @@ class DepthDependentConv(torch.nn.Module):
         n = channels * n_depth_bins
         self.n_depth_bins = n_depth_bins
         self.conv1 = torch.nn.Sequential(
-            torch.nn.Conv2d(channels, n, 3, groups=channels, padding=1, bias=False),
+            torch.nn.Conv2d(channels, n, 1, groups=channels),
         )
+
         self.conv2 = torch.nn.Sequential(
-            torch.nn.Conv2d(n, n, 3, groups=n_depth_bins, padding=1, bias=False),
-            # torch.nn.BatchNorm2d(n),
+            torch.nn.BatchNorm2d(n),
             torch.nn.ReLU(),
             torch.nn.Conv2d(n, n, 3, groups=n_depth_bins, padding=1, bias=False),
-            # torch.nn.BatchNorm2d(n),
+            # torch.nn.Conv2d(n, n, 3, groups=n_depth_bins, padding=1),
+            torch.nn.BatchNorm2d(n),
             torch.nn.ReLU(),
+           #  torch.nn.Conv2d(n, n, 3, groups=n_depth_bins, padding=1, bias=False),
+           #  torch.nn.BatchNorm2d(n),
+           #  torch.nn.ReLU(),
+            torch.nn.Conv2d(n, n, 3, groups=n_depth_bins, padding=1, bias=False),
+            torch.nn.BatchNorm2d(n),
+            # torch.nn.Conv2d(n, n, 3, groups=n_depth_bins, padding=1),
+            torch.nn.ReLU()
         )
 
     def forward(self, inputs):
@@ -109,9 +117,9 @@ class VoxelNet(pl.LightningModule):
 
         # self.cfg['MODEL']['BACKBONE3D']['CHANNELS'][0]
 
-        self.near_plane = .5
+        self.near_plane = 1
         self.far_plane = 5
-        self.n_depth_bins = 8
+        self.n_depth_bins = 10
         self.depth_dependent_conv = DepthDependentConv(cfg.MODEL.BACKBONE3D.CHANNELS[0], self.n_depth_bins)
 
 
@@ -233,8 +241,20 @@ class VoxelNet(pl.LightningModule):
         py = (camera[:,1,:]/camera[:,2,:]).round().type(torch.long)
         pz = camera[:,2,:]
 
-        z_ind = torch.round((pz - self.near_plane) / (self.far_plane - self.near_plane) * self.n_depth_bins).long()
-        z_ind = torch.clamp(z_ind, 0, self.n_depth_bins - 1)
+
+
+        z = (pz - self.near_plane) / (self.far_plane - self.near_plane) * self.n_depth_bins
+        z_ind_f = torch.floor(z)
+        z_ind_c = torch.ceil(z)
+        z_ind_f = torch.clamp(z_ind_f, 0, self.n_depth_bins - 1).long()
+        z_ind_c = torch.clamp(z_ind_c, 0, self.n_depth_bins - 1).long()
+        z_ind = torch.clamp(z, 0, self.n_depth_bins - 1)
+
+        mul_f = z_ind - z_ind_f
+        mul_c = z_ind_c - z_ind
+        inds = (mul_f + mul_c) == 0
+        mul_f[inds] = .5
+        mul_c[inds] = .5
 
         filtered_features = self.depth_dependent_conv(features)
 
@@ -246,7 +266,10 @@ class VoxelNet(pl.LightningModule):
                              device=device)
         for b in range(batch):
             # volume[b,:,valid[b]] = features[b,:,py[b,valid[b]], px[b,valid[b]]]
-            volume[b,:,valid[b]] = filtered_features[b, :, z_ind[b, valid[b]], py[b, valid[b]], px[b, valid[b]]]
+            feat_f = filtered_features[b, :, z_ind_f[b, valid[b]], py[b, valid[b]], px[b, valid[b]]]
+            feat_c = filtered_features[b, :, z_ind_c[b, valid[b]], py[b, valid[b]], px[b, valid[b]]]
+            volume[b,:,valid[b]] = feat_f * mul_f[b, valid[b]] + feat_c * mul_c[b, valid[b]]
+
 
         volume = volume.view(batch, channels, nx, ny, nz)
         valid = valid.view(batch, 1, nx, ny, nz)
@@ -411,6 +434,19 @@ class VoxelNet(pl.LightningModule):
 
 
     def training_step(self, batch, batch_idx):
+        n_start = 4000
+        n_ramp = 1000
+        target_lr = .0005
+
+        if self.global_step == n_start + 1:
+            self.optimizers().add_param_group({'params': self.heads3d.parameters(), 'lr': 0})
+            self.optimizers().add_param_group({'params': self.backbone3d.parameters(), 'lr': 0})
+
+        if self.global_step > n_start and self.global_step <= n_start + n_ramp:
+            lr = target_lr * min(1, (self.global_step - n_start) / n_ramp)
+            self.optimizers().param_groups[0]['lr'] = lr
+            self.optimizers().param_groups[1]['lr'] = lr
+
         outputs, losses = self.forward(batch)
         
         # visualize training outputs at the begining of each epoch
@@ -466,6 +502,12 @@ class VoxelNet(pl.LightningModule):
                         self.heads2d, self.heads3d]
         params_rest = itertools.chain(*(params.parameters() 
                                         for params in modules_rest))
+
+        return torch.optim.Adam([
+            # {'params': self.heads3d.parameters(), 'lr': 1e-10},
+            # {'params': self.backbone3d.parameters(), 'lr': 1e-10},
+            {'params': self.depth_dependent_conv.parameters(), 'lr': .0005},
+        ])
         
         # optimzer
         if self.cfg.OPTIMIZER.TYPE == 'Adam':
