@@ -81,10 +81,25 @@ def map_tsdf(info, data, voxel_types, voxel_sizes):
         dict with TSDFs included
     """
 
-    if len(voxel_types)>0:
-        for scale in voxel_sizes:
-            data['vol_%02d'%scale] = TSDF.load(info['file_name_vol_%02d'%scale],
-                                               voxel_types)
+    assert len(voxel_types)>0
+    assert voxel_sizes == [4, 8, 16]
+
+    tsdf_04 = TSDF.load(info['file_name_vol_04'], voxel_types)
+    tsdf_08 = TSDF(
+        .08,
+        tsdf_04.origin,
+        torch.nn.functional.max_pool3d(tsdf_04.tsdf_vol[None, None], 2)[0, 0]
+    )
+    tsdf_16 = TSDF(
+        .16,
+        tsdf_04.origin,
+        torch.nn.functional.max_pool3d(tsdf_04.tsdf_vol[None, None], 4)[0, 0]
+    )
+
+    data['vol_04'] = tsdf_04
+    data['vol_08'] = tsdf_08
+    data['vol_16'] = tsdf_16
+
     return data
 
 
