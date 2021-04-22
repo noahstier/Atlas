@@ -250,8 +250,8 @@ class VoxelNet(pl.LightningModule):
         z_ind_c = torch.clamp(z_ind_c, 0, self.n_depth_bins - 1).long()
         z_ind = torch.clamp(z, 0, self.n_depth_bins - 1)
 
-        mul_f = z_ind - z_ind_f
-        mul_c = z_ind_c - z_ind
+        mul_f = 1 - (z_ind - z_ind_f)
+        mul_c = 1 - (z_ind_c - z_ind)
         inds = (mul_f + mul_c) == 0
         mul_f[inds] = .5
         mul_c[inds] = .5
